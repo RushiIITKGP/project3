@@ -135,7 +135,7 @@ def get_moves_from_path(path):
     return moves
 
 
-def update_belief(L, move, graph):
+def update_belief(L, move, graph, D):
     L_new = set()
 
     #print("botpos -", bot_pos)
@@ -280,7 +280,7 @@ if __name__=="__main__":
                 moves = get_moves_from_path(path)
 
                 for move in moves:
-                    L = update_belief(L, move, graph)
+                    L = update_belief(L, move, graph, D)
                     L = list(L)
                     total_moves += 1
                     #print("L_new - ", L)
