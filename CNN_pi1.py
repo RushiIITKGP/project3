@@ -50,38 +50,19 @@ class CNN_MovePredictor(nn.Module):
     def __init__(self):
         super(CNN_MovePredictor, self).__init__()
         self.conv1 = nn.Conv2d(2, 16, 3, padding=1)
-        self.bn1 = nn.BatchNorm2d(16)
         self.conv2 = nn.Conv2d(16, 32, 3, padding=1)
-        self.bn2 = nn.BatchNorm2d(32)
         self.conv3 = nn.Conv2d(32, 64, 3, padding=1)
-        self.bn3 = nn.BatchNorm2d(64)
-        self.conv4 = nn.Conv2d(64, 128, 3, padding=1)
-        self.bn4 = nn.BatchNorm2d(128)
-        self.conv5 = nn.Conv2d(128, 64, 3, padding=1)
-        self.bn5 = nn.BatchNorm2d(64)
         self.pool = nn.MaxPool2d(2)
         self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
-
-        self.conv_regressor = nn.Conv2d(64, 1, kernel_size=1)
-
-        # self.fc1 = nn.Linear(128, 256)
-        # self.fc2 = nn.Linear(256, 128)
-        # self.fc3 = nn.Linear(128, 64)
-        # self.fc4 = nn.Linear(64, 1)
-
-        # self.dropout1 = nn.Dropout(0.3)
-        # self.dropout2 = nn.Dropout(0.3)
-        # self.dropout3 = nn.Dropout(0.2)
+        self.regressor = nn.Conv2d(64, 1, kernel_size=1)
 
     def forward(self, x):
-        x = self.pool(F.relu(self.bn1(self.conv1(x))))
-        x = self.pool(F.relu(self.bn2(self.conv2(x))))
-        x = self.pool(F.relu(self.bn3(self.conv3(x))))
-        x = self.pool(F.relu(self.bn4(self.conv4(x))))
-        x = F.relu(self.bn5(self.conv5(x)))
-        x = self.global_pool(x)  # Shape: [B, 128, 1, 1]
-        x = self.conv_regressor(x)  # Shape: [B, 1, 1, 1]
-        x = F.softplus(x)  # Ensure non-negative output
+        x = self.pool(F.relu(self.conv1(x)))
+        x = self.pool(F.relu(self.conv2(x)))
+        x = self.pool(F.relu(self.conv3(x)))
+        x = self.global_pool(x)
+        x = self.regressor(x)
+        return F.softplus(x).view(x.size(0))
         return x.view(x.size(0))
 
     # ---------- Training Script ----------
@@ -101,16 +82,15 @@ if __name__ == "__main__":
 
     model = CNN_MovePredictor().to(device)
     loss_function = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.0001, weight_decay=1e-4)
+    optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
 
     num_epochs = 50
     best_r2 = -float('inf')
     patience = 10
     wait = 0
-
     train_losses = []
-
+    test_losses_per_epoch = []
 
     for epoch in range(num_epochs):
         model.train()
@@ -134,20 +114,24 @@ if __name__ == "__main__":
         train_losses.append(avg_train_loss)
         print(f"Epoch {epoch+1} Train Loss: {avg_train_loss:.4f}")
 
-
-
         # Validation pass
         model.eval()
+        test_loss = 0
         records = []
         with torch.no_grad():
             for batch_inputs, batch_targets, L_sizes in test_loader:
                 batch_inputs = batch_inputs.to(device)
-                preds = model(batch_inputs) * scale_factor
-                preds = preds.detach().cpu().numpy()
-                batch_targets = batch_targets.numpy()
-                L_sizes = L_sizes.numpy()
-                for l, p, a in zip(L_sizes, preds, batch_targets):
+                batch_targets_scaled = (batch_targets / scale_factor).to(device)
+                preds = model(batch_inputs)
+                loss = loss_function(preds, batch_targets_scaled)
+                test_loss += loss.item()
+
+                preds_rescaled = preds.cpu().numpy() * scale_factor
+                for l, p, a in zip(L_sizes.numpy(), preds_rescaled, batch_targets.numpy()):
                     records.append({'L_size': l, 'Predicted': p, 'Actual': a})
+
+            avg_test_loss = test_loss / len(test_loader)
+            test_losses_per_epoch.append(avg_test_loss)
 
         df_eval = pd.DataFrame(records)
         r2 = r2_score(df_eval['Actual'], df_eval['Predicted'])
@@ -157,9 +141,8 @@ if __name__ == "__main__":
 
         scheduler.step(rmse)
 
-        print(f"✅ R²: {r2:.4f} | MAE: {mae:.2f} | RMSE: {rmse:.2f}")
+        print(f" R²: {r2:.4f} | MAE: {mae:.2f} | RMSE: {rmse:.2f}")
 
-        # ----------- Early Stopping Logic -----------
         if epoch > 15:
             if r2 > best_r2 + 1e-3:
                 best_r2 = r2
@@ -170,27 +153,27 @@ if __name__ == "__main__":
             else:
                 wait += 1
                 if wait >= patience:
-                    print(f"⏹ Early stopping triggered at epoch {epoch + 1}")
+                    print(f" Early stopping triggered at epoch {epoch + 1}")
                     break
 
-    print(f"\n✅ Training complete. Best R²: {best_r2:.4f}")
+
+
+    print(f"\n Training complete. Best R²: {best_r2:.4f}")
 
 
     # ---------- Smooth with Moving Average ----------
     def moving_average(values, window=5):
-        return [sum(values[max(0, i - window + 1):i + 1]) / (i - max(0, i - window + 1) + 1) for i in
-                range(len(values))]
-
+        return [sum(values[max(0, i - window + 1):i + 1]) / (i - max(0, i - window + 1) + 1) for i in range(len(values))]
 
     smoothed_train = moving_average(train_losses)
+    smoothed_test = moving_average(test_losses_per_epoch)
 
-    # ---------- Plot ----------
     plt.figure(figsize=(8, 5))
     plt.plot(smoothed_train, label="Train Loss (Smoothed)")
-    #plt.plot(smoothed_val, label="Validation RMSE (Smoothed)")
+    plt.plot(smoothed_test, label="Test Loss (Smoothed)", linestyle='--')
     plt.xlabel("Epoch")
-    plt.ylabel("Loss / RMSE")
-    plt.title("Loss Curve")
+    plt.ylabel("Loss")
+    plt.title("Train vs Test Loss Over Epochs")
     plt.legend()
     plt.grid(True)
     plt.tight_layout()
@@ -237,7 +220,7 @@ if __name__ == "__main__":
 
     plt.xlabel('Initial Belief Set Size |L|')
     plt.ylabel('Average Moves to Localize')
-    plt.title('Comparison: Actual Pi1 Moves vs. CNN Model Prediction')
+    plt.title('Comparison: Actual Pi0 Moves vs. CNN Model Prediction')
     plt.xlim(0, 550)
     plt.xticks(range(0, 551, 10), rotation=45, fontsize=10)
     plt.ylim(0, 550)
